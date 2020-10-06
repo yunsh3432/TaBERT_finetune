@@ -44,6 +44,18 @@ class table:
                 f"{body}")
 
 
+def table_tokenize(Tmodel, tp):
+        table = Table(
+            id=tp.title,
+            header=[Column(h.strip(), 'text') for h in tp.heading],
+            data=tp.body
+        ).tokenize(Tmodel.tokenizer)
+        
+        context = tp.caption
+        context = [Tmodel.tokenizer.tokenize(context)]
+        
+        return table, context
+    
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
@@ -53,8 +65,20 @@ class Model(nn.Module):
         self.Tmodel = TableBertModel.from_pretrained(
             TABERT_MODEL_PATH,
         )
-
-    def forward(self, q, tp, tn=None):
+    
+    def table_tokenize(tp):
+        table = Table(
+            id=tp.title,
+            header=[Column(h.strip(), 'text') for h in tp.heading],
+            data=tp.body
+        ).tokenize(self.Tmodel.tokenizer)
+        
+        context = tp.caption
+        context = [self.Tmodel.tokenizer.tokenize(context)]
+        
+        return table, context
+        
+    def forward(self, q, tp, tp_context, tn=None, tn_context):
         # cosSim(queryCLS[1,768], (avgPoll(context)[1,768] + avgPool(column)[1,768]))
         cosine_similarity = torch.nn.CosineSimilarity(dim=1, eps=1e-6).to(device)
         avgPool = torch.nn.AdaptiveAvgPool2d([1, 768]).to(device)
@@ -67,17 +91,11 @@ class Model(nn.Module):
         }
         qCLS = self.Qmodel(**inputs)[1].to(device)
 
-        # table postive embedding
-        table = Table(
-            id=tp.title,
-            header=[Column(h.strip(), 'text') for h in tp.heading],
-            data=tp.body
-        ).tokenize(self.Tmodel.tokenizer)
+        # table postive embedding       
 
-        context = tp.caption
         context_encoding, column_encoding, _ = self.Tmodel.encode(
-            contexts=[self.Tmodel.tokenizer.tokenize(context)],
-            tables=[table]
+            contexts=tp_context,
+            tables=[tp]
         )
         tp_concat_encoding = avgPool(context_encoding) + avgPool(column_encoding)
         q_tp_cos = cosine_similarity(qCLS, tp_concat_encoding)
@@ -85,16 +103,9 @@ class Model(nn.Module):
         # if tn==None -> Eval시 사용
         if tn is not None:
             # Table negative
-            table = Table(
-                id=tn.title,
-                header=[Column(d.strip(), 'text') for d in tn.heading],
-                data=tn.body
-            ).tokenize(self.Tmodel.tokenizer)
-
-            context = tn.caption
             context_encoding, column_encoding, _ = self.Tmodel.encode(
-                contexts=[self.Tmodel.tokenizer.tokenize(context)],
-                tables=[table]
+                contexts=tn_context,
+                tables=[tn]
             )
             tn_concat_encoding = avgPool(context_encoding) + avgPool(column_encoding)
             q_tn_cos = cosine_similarity(qCLS, tn_concat_encoding)
@@ -167,11 +178,14 @@ def load_query_data(_filepath='./querys.txt')-> List:
     return query_list
 
 
-def build_dataset(_queryList, _tablePosList, _tableNegList):
+def build_dataset(_queryList, _tablePosList, _tableNegList, model):
     """
     :return: <Q, T_p, T_n> list
     """
     # Pre tokenize
+    #model : Model(Bert, TaBERT)
+    
+    model = model.TBert
     query_tensor_list = []
     for q in _queryList:
         input_ids = tokenizer.encode_plus(q,
@@ -191,6 +205,9 @@ def build_dataset(_queryList, _tablePosList, _tableNegList):
             if tp.qid == tn.qid:  # T_p 와 T_n의 QueryId를 같은것을 묶음
                 query = query_tensor_list[int(tp.qid) - 1]  # QueryId가 1부터 시작이라 - 1
                 q_list.append(query)
+                #
+                # Table Tokenizing
+                #
                 tp_list.append(tp)
                 tn_list.append(tn)
     return list(zip(q_list, tp_list, tn_list))
@@ -229,6 +246,12 @@ if __name__ == "__main__":
 
     # BERT Model Load
     tokenizer = BertTokenizer.from_pretrained(BERT_MODEL)
+    
+    # Create model
+    model = Model()
+    model.to(device)
+    log('s', "Create model")
+    print(model)
 
     # Data Load
     tablePosList, tableNegList = load_table_data(_filepath=TABLE_JSON_FILE)
@@ -236,21 +259,20 @@ if __name__ == "__main__":
     log('s', "Load table, query datas")
 
     # Build Dataset <Q, T_p, T_n>
-    trainDataset = build_dataset(queryList, tablePosList, tableNegList)
+    trainDataset = build_dataset(queryList, tablePosList, tableNegList, model)
     log('i', f"Total Train Data set Cnt : {len(trainDataset)}")
 
-    # Create model
-    model = Model()
-    model.to(device)
-    log('s', "Create model")
-    print(model)
-
+ 
     # Optimizer & Loss
     target = torch.ones(1).sign() # MarginRankingLoss Target
     criterion = nn.MarginRankingLoss(margin=MARGIN, reduction="mean")  # infer땐 빼라
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     # Train
+    # 밖에서 query, tableP, tableP_context, tableN, tableN_context
+    tableP, tableP_context = model.table_tokenize(TP)
+    tableN, tableN_context = model.table_tokenize(TN)
+
     for epoch in tqdm(range(EPOCH_NUM)):
         if SHUFFLE: random.shuffle(trainDataset)
         _epochLossList = []
@@ -258,8 +280,8 @@ if __name__ == "__main__":
         prevIdx = 0 # for batch idx
         for idx in range(BATCH_SIZE, len(trainDataset), BATCH_SIZE):
             _lossList = []
-            for query, tableP, tableN in trainDataset[prevIdx:idx]:
-                tpCos, tnCos = model(query, tableP, tableN)
+            for query, tableP, tableP_context, tableN, tableN_context in trainDataset[prevIdx:idx]:
+                tpCos, tnCos = model(query, tableP, tableP_context, tableN, tableN_context)
                 loss = criterion(torch.tensor([abs(torch.mean(tpCos))], requires_grad=True),
                                  torch.tensor([abs(torch.mean(tnCos))], requires_grad=True),
                                  target)
